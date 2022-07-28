@@ -11,9 +11,6 @@ import torch.nn as nn
 from itertools import count
 import torch.backends.cudnn as cudnn
 from quantization.quantizer import ModelQuantizer
-from quantization.posttraining.module_wrapper import ActivationModuleWrapperPost, ParameterModuleWrapperPost
-from quantization.methods.clipped_uniform import FixedClipValueQuantization
-# from quantization.posttraining.cnn_classifier import CnnModel
 import pickle
 from tqdm import tqdm
 
@@ -21,7 +18,6 @@ from tqdm import tqdm
 from utils.data import get_dataset
 from utils.preprocess import get_transform
 from utils.meters import AverageMeter, ProgressMeter, accuracy
-from torch.utils.data import RandomSampler
 from models.resnet import resnet as custom_resnet
 from models.inception import inception_v3 as custom_inception
 from utils.misc import normalize_module_name, arch2depth
@@ -179,6 +175,425 @@ class CnnModel(object):
 
         return top1.avg
 # CnnModel file ends
+
+# We have module_wrapper here
+from quantization.methods.clipped_uniform import AngDistanceQuantization, L3NormQuantization, L2NormQuantization, \
+    LpNormQuantization, L1NormQuantization
+from quantization.methods.clipped_uniform import MaxAbsStaticQuantization, AciqLaplaceQuantization, \
+    AciqGausQuantization, LogLikeQuantization
+from quantization.methods.clipped_uniform import MseNoPriorQuantization, MseUniformPriorQuantization
+from quantization.methods.non_uniform import KmeansQuantization
+
+quantization_mapping = {'max_static': MaxAbsStaticQuantization,
+                        'aciq_laplace': AciqLaplaceQuantization,
+                        'aciq_gaus': AciqGausQuantization,
+                        'mse_uniform_prior': MseUniformPriorQuantization,
+                        'mse_no_prior': MseNoPriorQuantization,
+                        'ang_dis': AngDistanceQuantization,
+                        'l3_norm': L3NormQuantization,
+                        'l2_norm': L2NormQuantization,
+                        'l1_norm': L1NormQuantization,
+                        'lp_norm': LpNormQuantization,
+                        'log_like': LogLikeQuantization
+                        }
+
+
+def is_positive(module):
+    return isinstance(module, nn.ReLU) or isinstance(module, nn.ReLU6)
+
+
+class ActivationModuleWrapperPost(nn.Module):
+    def __init__(self, name, wrapped_module, **kwargs):
+        super(ActivationModuleWrapperPost, self).__init__()
+        self.name = name
+        self.wrapped_module = wrapped_module
+        self.bits_out = kwargs['bits_out']
+        self.qtype = kwargs['qtype']
+        self.post_relu = True
+        self.enabled = True
+        self.active = True
+
+        if self.bits_out is not None:
+            self.out_quantization = self.out_quantization_default = None
+
+            def __init_out_quantization__(tensor):
+                self.out_quantization_default = quantization_mapping[self.qtype](self, tensor, self.bits_out,
+                                                                                 symmetric=(not is_positive(wrapped_module)),
+                                                                                 uint=True, kwargs=kwargs)
+                self.out_quantization = self.out_quantization_default
+                print("ActivationModuleWrapperPost - {} | {} | {}".format(self.name, str(self.out_quantization), str(tensor.device)))
+
+            self.out_quantization_init_fn = __init_out_quantization__
+
+    def __enabled__(self):
+        return self.enabled and self.active and self.bits_out is not None
+
+    def forward(self, *input):
+        # Uncomment to enable dump
+        # torch.save(*input, os.path.join('dump', self.name + '_in' + '.pt'))
+
+        if self.post_relu:
+            out = self.wrapped_module(*input)
+
+            # Quantize output
+            if self.__enabled__():
+                self.verify_initialized(self.out_quantization, out, self.out_quantization_init_fn)
+                out = self.out_quantization(out)
+        else:
+            # Quantize output
+            if self.__enabled__():
+                self.verify_initialized(self.out_quantization, *input, self.out_quantization_init_fn)
+                out = self.out_quantization(*input)
+            else:
+                out = self.wrapped_module(*input)
+
+        # Uncomment to enable dump
+        # torch.save(out, os.path.join('dump', self.name + '_out' + '.pt'))
+
+        return out
+
+    def get_quantization(self):
+        return self.out_quantization
+
+    def set_quantization(self, qtype, kwargs, verbose=False):
+        self.out_quantization = qtype(self, self.bits_out, symmetric=(not is_positive(self.wrapped_module)),
+                                      uint=True, kwargs=kwargs)
+        if verbose:
+            print("ActivationModuleWrapperPost - {} | {} | {}".format(self.name, str(self.out_quantization),
+                                                                      str(kwargs['device'])))
+
+    def set_quant_method(self, method=None):
+        if self.bits_out is not None:
+            if method == 'kmeans':
+                self.out_quantization = KmeansQuantization(self.bits_out)
+            else:
+                self.out_quantization = self.out_quantization_default
+
+    @staticmethod
+    def verify_initialized(quantization_handle, tensor, init_fn):
+        if quantization_handle is None:
+            init_fn(tensor)
+
+    def log_state(self, step, ml_logger):
+        if self.__enabled__():
+            if self.out_quantization is not None:
+                for n, p in self.out_quantization.named_parameters():
+                    if p.numel() == 1:
+                        ml_logger.log_metric(self.name + '.' + n, p.item(),  step='auto')
+                    else:
+                        for i, e in enumerate(p):
+                            ml_logger.log_metric(self.name + '.' + n + '.' + str(i), e.item(),  step='auto')
+
+
+class ParameterModuleWrapperPost(nn.Module):
+    def __init__(self, name, wrapped_module, **kwargs):
+        super(ParameterModuleWrapperPost, self).__init__()
+        self.name = name
+        self.wrapped_module = wrapped_module
+        self.forward_functor = kwargs['forward_functor']
+        self.bit_weights = kwargs['bits_weight']
+        self.bits_out = kwargs['bits_out']
+        self.qtype = kwargs['qtype']
+        self.enabled = True
+        self.active = True
+        self.centroids_hist = {}
+        self.log_weights_hist = False
+        self.log_weights_mse = False
+        self.log_clustering = False
+        self.bn = kwargs['bn'] if 'bn' in kwargs else None
+        self.dynamic_weight_quantization = True
+        self.bcorr_w = kwargs['bcorr_w']
+
+        setattr(self, 'weight', wrapped_module.weight)
+        delattr(wrapped_module, 'weight')
+        if hasattr(wrapped_module, 'bias'):
+            setattr(self, 'bias', wrapped_module.bias)
+            delattr(wrapped_module, 'bias')
+
+        if self.bit_weights is not None:
+            self.weight_quantization_default = quantization_mapping[self.qtype](self, self.weight, self.bit_weights,
+                                                                             symmetric=True, uint=True, kwargs=kwargs)
+            self.weight_quantization = self.weight_quantization_default
+            if not self.dynamic_weight_quantization:
+                self.weight_q = self.weight_quantization(self.weight)
+                self.weight_mse = torch.mean((self.weight_q - self.weight)**2).item()
+            print("ParameterModuleWrapperPost - {} | {} | {}".format(self.name, str(self.weight_quantization),
+                                                                      str(self.weight.device)))
+
+    def __enabled__(self):
+        return self.enabled and self.active and self.bit_weights is not None
+
+    def bias_corr(self, x, xq):
+        bias_q = xq.view(xq.shape[0], -1).mean(-1)
+        bias_orig = x.view(x.shape[0], -1).mean(-1)
+        bcorr = bias_q - bias_orig
+
+        return xq - bcorr.view(bcorr.numel(), 1, 1, 1) if len(x.shape) == 4 else xq - bcorr.view(bcorr.numel(), 1)
+
+    def forward(self, *input):
+        w = self.weight
+        if self.__enabled__():
+            # Quantize weights
+            if self.dynamic_weight_quantization:
+                w = self.weight_quantization(self.weight)
+
+                if self.bcorr_w:
+                    w = self.bias_corr(self.weight, w)
+            else:
+                w = self.weight_q
+
+        out = self.forward_functor(*input, weight=w, bias=(self.bias if hasattr(self, 'bias') else None))
+
+        return out
+
+    def get_quantization(self):
+        return self.weight_quantization
+
+    def set_quantization(self, qtype, kwargs, verbose=False):
+        self.weight_quantization = qtype(self, self.bit_weights, symmetric=True, uint=True, kwargs=kwargs)
+        if verbose:
+            print("ParameterModuleWrapperPost - {} | {} | {}".format(self.name, str(self.weight_quantization),
+                                                                      str(kwargs['device'])))
+
+    def set_quant_method(self, method=None):
+        if self.bit_weights is not None:
+            if method is None:
+                self.weight_quantization = self.weight_quantization_default
+            elif method == 'kmeans':
+                self.weight_quantization = KmeansQuantization(self.bit_weights)
+            else:
+                self.weight_quantization = self.weight_quantization_default
+
+    # TODO: make it more generic
+    def set_quant_mode(self, mode=None):
+        if self.bit_weights is not None:
+            if mode is not None:
+                self.soft = self.weight_quantization.soft_quant
+                self.hard = self.weight_quantization.hard_quant
+            if mode is None:
+                self.weight_quantization.soft_quant = self.soft
+                self.weight_quantization.hard_quant = self.hard
+            elif mode == 'soft':
+                self.weight_quantization.soft_quant = True
+                self.weight_quantization.hard_quant = False
+            elif mode == 'hard':
+                self.weight_quantization.soft_quant = False
+                self.weight_quantization.hard_quant = True
+
+    def log_state(self, step, ml_logger):
+        if self.__enabled__():
+            if self.weight_quantization is not None:
+                for n, p in self.weight_quantization.loggable_parameters():
+                    if p.numel() == 1:
+                        ml_logger.log_metric(self.name + '.' + n, p.item(),  step='auto')
+                    else:
+                        for i, e in enumerate(p):
+                            ml_logger.log_metric(self.name + '.' + n + '.' + str(i), e.item(),  step='auto')
+
+            if self.log_weights_hist:
+                ml_logger.tf_logger.add_histogram(self.name + '.weight', self.weight.cpu().flatten(),  step='auto')
+
+            if self.log_weights_mse:
+                ml_logger.log_metric(self.name + '.mse_q', self.weight_mse,  step='auto')
+# module_wrapper ends here
+
+# quantizer.py starts here
+import torch
+import torch.nn as nn
+import numpy as np
+from itertools import count
+from quantization.methods.clipped_uniform import LearnedStepSizeQuantization
+from quantization.methods.non_uniform import LearnableDifferentiableQuantization, LearnedCentroidsQuantization
+from quantization.methods.clipped_uniform import FixedClipValueQuantization
+# from utils.absorb_bn import is_absorbing, is_bn
+
+
+class Conv2dFunctor:
+    def __init__(self, conv2d):
+        self.conv2d = conv2d
+
+    def __call__(self, *input, weight, bias):
+        res = torch.nn.functional.conv2d(*input, weight, bias, self.conv2d.stride, self.conv2d.padding,
+                                         self.conv2d.dilation, self.conv2d.groups)
+        return res
+
+
+class LinearFunctor:
+    def __init__(self, linear):
+        self.linear = linear
+
+    def __call__(self, *input, weight, bias):
+        res = torch.nn.functional.linear(*input, weight, bias)
+        return res
+
+
+class EmbeddingFunctor:
+    def __init__(self, embedding):
+        self.embedding = embedding
+
+    def __call__(self, *input, weight, bias=None):
+        res = torch.nn.functional.embedding(
+            *input, weight, self.embedding.padding_idx, self.embedding.max_norm,
+            self.embedding.norm_type, self.embedding.scale_grad_by_freq, self.embedding.sparse)
+        return res
+
+
+class OptimizerBridge(object):
+    def __init__(self, optimizer, settings={'algo': 'SGD', 'dataset': 'imagenet'}):
+        self.optimizer = optimizer
+        self.settings = settings
+
+    def add_quantization_params(self, all_quant_params):
+        key = self.settings['algo'] + '_' + self.settings['dataset']
+        if key in all_quant_params:
+            quant_params = all_quant_params[key]
+            for group in quant_params:
+                self.optimizer.add_param_group(group)
+
+
+class ModelQuantizer:
+    def __init__(self, model, args, quantizable_layers, replacement_factory, optimizer_bridge=None):
+        self.model = model
+        self.args = args
+        self.bit_weights = args.bit_weights
+        self.bit_act = args.bit_act
+        self.post_relu = True
+        self.functor_map = {nn.Conv2d: Conv2dFunctor, nn.Linear: LinearFunctor, nn.Embedding: EmbeddingFunctor}
+        self.replacement_factory = replacement_factory
+
+        self.optimizer_bridge = optimizer_bridge
+
+        self.quantization_wrappers = []
+        self.quantizable_modules = []
+        self.quantizable_layers = quantizable_layers
+        self._pre_process_container(model)
+        self._create_quantization_wrappers()
+
+        # TODO: hack, make it generic
+        self.quantization_params = LearnedStepSizeQuantization.learned_parameters()
+
+    def load_state_dict(self, state_dict):
+        for name, qwrapper in self.quantization_wrappers:
+            qwrapper.load_state_dict(state_dict)
+
+    def freeze(self):
+        for n, p in self.model.named_parameters():
+            # TODO: hack, make it more robust
+            if not np.any([qp in n for qp in self.quantization_params]):
+                p.requires_grad = False
+
+    @staticmethod
+    def has_children(module):
+        try:
+            next(module.children())
+            return True
+        except StopIteration:
+            return False
+
+    def _create_quantization_wrappers(self):
+        for qm in self.quantizable_modules:
+            # replace module by it's wrapper
+            fn = self.functor_map[type(qm.module)](qm.module) if type(qm.module) in self.functor_map else None
+            args = {"bits_out": self.bit_act, "bits_weight": self.bit_weights, "forward_functor": fn,
+                    "post_relu": self.post_relu, "optim_bridge": self.optimizer_bridge}
+            args.update(vars(self.args))
+            if hasattr(qm, 'bn'):
+                args['bn'] = qm.bn
+            module_wrapper = self.replacement_factory[type(qm.module)](qm.full_name, qm.module,
+                                                                    **args)
+            setattr(qm.container, qm.name, module_wrapper)
+            self.quantization_wrappers.append((qm.full_name, module_wrapper))
+
+    def _pre_process_container(self, container, prefix=''):
+        prev, prev_name = None, None
+        for name, module in container.named_children():
+            full_name = prefix + name
+            if full_name in self.quantizable_layers:
+                self.quantizable_modules.append(
+                    type('', (object,), {'name': name, 'full_name': full_name, 'module': module, 'container': container})()
+                )
+
+            if self.has_children(module):
+                # For container we call recursively
+                self._pre_process_container(module, full_name + '.')
+
+            prev = module
+            prev_name = full_name
+
+    def log_quantizer_state(self, ml_logger, step):
+        if self.bit_weights is not None or self.bit_act is not None:
+            with torch.no_grad():
+                for name, qwrapper in self.quantization_wrappers:
+                    qwrapper.log_state(step, ml_logger)
+
+    def get_qwrappers(self):
+        return [qwrapper for (name, qwrapper) in self.quantization_wrappers if qwrapper.__enabled__()]
+
+    def set_clipping(self, clipping, device):  # TODO: handle device internally somehow
+        qwrappers = self.get_qwrappers()
+        for i, qwrapper in enumerate(qwrappers):
+            qwrapper.set_quantization(FixedClipValueQuantization,
+                                      {'clip_value': clipping[i], 'device': device})
+
+    def get_clipping(self):
+        clipping = []
+        qwrappers = self.get_qwrappers()
+        for i, qwrapper in enumerate(qwrappers):
+            q = qwrapper.get_quantization()
+            clip_value = getattr(q, 'alpha')
+            clipping.append(clip_value.item())
+
+        return qwrappers[0].get_quantization().alpha.new_tensor(clipping)
+
+    class QuantMethod:
+        def __init__(self, quantization_wrappers, method):
+            self.quantization_wrappers = quantization_wrappers
+            self.method = method
+
+        def __enter__(self):
+            for n, qw in self.quantization_wrappers:
+                qw.set_quant_method(self.method)
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            for n, qw in self.quantization_wrappers:
+                qw.set_quant_method()
+
+    class QuantMode:
+        def __init__(self, quantization_wrappers, mode):
+            self.quantization_wrappers = quantization_wrappers
+            self.mode = mode
+
+        def __enter__(self):
+            for n, qw in self.quantization_wrappers:
+                qw.set_quant_mode(self.mode)
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            for n, qw in self.quantization_wrappers:
+                qw.set_quant_mode()
+
+    class DisableQuantizer:
+        def __init__(self, quantization_wrappers):
+            self.quantization_wrappers = quantization_wrappers
+
+        def __enter__(self):
+            for n, qw in self.quantization_wrappers:
+                qw.active = False
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            for n, qw in self.quantization_wrappers:
+                qw.active = True
+
+    def quantization_method(self, method):
+        return ModelQuantizer.QuantMethod(self.quantization_wrappers, method)
+
+    def quantization_mode(self, mode):
+        return ModelQuantizer.QuantMode(self.quantization_wrappers, mode)
+
+    def disable(self):
+        return ModelQuantizer.DisableQuantizer(self.quantization_wrappers)
+# quantizer.py ends here
+
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))

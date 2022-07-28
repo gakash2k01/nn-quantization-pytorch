@@ -38,35 +38,6 @@ class EmbeddingFunctor:
         return res
 
 
-# class QuantizationScheduler(object):
-#     _iter_counter = count(0)
-#
-#     def __init__(self, model, optimizer, grad_rate, enable=True):
-#         self.quantizations = []
-#         self.optimizer = optimizer
-#         self.grad_rate = grad_rate
-#         self.scheduling_enabled = enable
-#
-#         model.register_forward_hook(lambda m, inp, out: self.step(m))
-#
-#     def register_module_quantization(self, qwrapper):
-#         self.quantizations.append(qwrapper)
-#         if len(self.quantizations) == 1 or not self.scheduling_enabled:
-#             qwrapper.enabled = True
-#         else:
-#             qwrapper.enabled = False
-#
-#     def step(self, model):
-#         if model.training:
-#             step = next(QuantizationScheduler._iter_counter)
-#
-#         if self.scheduling_enabled and model.training:
-#             if step % self.grad_rate == 0:
-#                 i = int(step / self.grad_rate)
-#                 if i < len(self.quantizations):
-#                     self.quantizations[i].enabled = True
-
-
 class OptimizerBridge(object):
     def __init__(self, optimizer, settings={'algo': 'SGD', 'dataset': 'imagenet'}):
         self.optimizer = optimizer
@@ -111,18 +82,6 @@ class ModelQuantizer:
             if not np.any([qp in n for qp in self.quantization_params]):
                 p.requires_grad = False
 
-        # for n, p in self.model.named_parameters():
-        #     if not ('conv' in n or 'downsample.0' in n):
-        #         p.requires_grad = False
-
-        # for n, p in self.model.named_parameters():
-        #     if not ('bn' in n or 'downsample.1' in n):
-        #         p.requires_grad = False
-
-        # for n, m in self.model.named_modules():
-        #     if isinstance(m, nn.BatchNorm2d):
-        #         m.momentum = 0
-
     @staticmethod
     def has_children(module):
         try:
@@ -148,10 +107,6 @@ class ModelQuantizer:
     def _pre_process_container(self, container, prefix=''):
         prev, prev_name = None, None
         for name, module in container.named_children():
-            # if is_bn(module) and is_absorbing(prev) and prev_name in self.quantizable_layers:
-            #     # Pass BN module to prev module quantization wrapper for BN folding/unfolding
-            #     self.quantizable_modules[-1].bn = module
-
             full_name = prefix + name
             if full_name in self.quantizable_layers:
                 self.quantizable_modules.append(
