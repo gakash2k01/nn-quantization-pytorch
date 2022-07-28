@@ -13,7 +13,6 @@ import torch.backends.cudnn as cudnn
 from quantization.quantizer import ModelQuantizer
 from quantization.posttraining.module_wrapper import ActivationModuleWrapperPost, ParameterModuleWrapperPost
 from quantization.methods.clipped_uniform import FixedClipValueQuantization
-from utils.mllog import MLlogger
 from quantization.posttraining.cnn_classifier import CnnModel
 import pickle
 from tqdm import tqdm
@@ -22,6 +21,40 @@ from tqdm import tqdm
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
+
+#Arguments dictionary
+kwargs = {
+    'arch' : 'resnet18',
+    'dataset' : 'imagenet',
+    'datapath' : "/workspace/code/Akash/ImageNet",
+    'workers' : 4,
+    'batch_size' : 256,
+    'cal-batch-size' : None,
+    'cal-set-size' : None,
+    'print-freq' : 10,
+    'resume' : '',
+    'evaluate' : True,
+    'pretrained' : True,
+    'custom_resnet': True,
+    'seed' : 0,
+    'gpu_ids' : [6],
+    'shuffle' : True,
+    'experiment' : 'default',
+    'bit_weights' : None,
+    'bit_act' : None,
+    'pre_relu' : True,
+    'qtype' :'max_static',
+    'lp' : 3.0,
+    'min_method' : 'Powell',
+    'maxiter' : None,
+    'maxfev' : None,
+    'init_method' : 'static',
+    'siv' : 1. ,
+    'dont_fix_np_seed' : True,
+    'bcorr_w' : True,
+    'tag' : 'n/a',
+    'bn_folding' : True
+    }
 
 home = str(Path.home())
 parser = argparse.ArgumentParser()
@@ -138,7 +171,7 @@ def coord_descent(fun, init, args, **kwargs):
     return res
 
 
-def main(args, ml_logger):
+def main(args):
     # Fix the seed
     random.seed(args.seed)
     if not args.dont_fix_np_seed:
@@ -148,13 +181,6 @@ def main(args, ml_logger):
     cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    if args.tag is not None:
-        ml_logger.mlflow.log_param('tag', args.tag)
-
-    # enable_bcorr = False
-    # if args.bcorr_w:
-    #     args.bcorr_w = False
-    #     enable_bcorr = True
 
     args.qtype = 'max_static'
     # create model
@@ -188,11 +214,9 @@ def main(args, ml_logger):
     maxabs_loss = inf_model.evaluate_calibration()
     print("max loss: {:.4f}".format(maxabs_loss.item()))
     max_point = mq.get_clipping()
-    ml_logger.log_metric('Loss max', maxabs_loss.item(), step='auto')
 
     # evaluate
     maxabs_acc = 0#inf_model.validate()
-    ml_logger.log_metric('Acc maxabs', maxabs_acc, step='auto')
     data = {'max': {'alpha': max_point.cpu().numpy(), 'loss': maxabs_loss.item(), 'acc': maxabs_acc}}
 
     del inf_model
@@ -262,31 +286,14 @@ def main(args, ml_logger):
     p_intr = y.deriv().roots[0]
     # loss_opt = y(p_intr)
     print("p intr: {:.2f}".format(p_intr))
-    ml_logger.log_metric('p intr', p_intr, step='auto')
 
     lp_point, lp_loss, lp_acc = eval_pnorm(p_intr)
 
     print("loss p intr: {:.4f}".format(lp_loss.item()))
     print("acc p intr: {:.4f}".format(lp_acc))
-    ml_logger.log_metric('Init loss', lp_loss.item(), step='auto')
-    ml_logger.log_metric('Acc init', lp_acc, step='auto')
 
     global _eval_count, _min_loss
     _min_loss = lp_loss.item()
-
-    # loss_best = np.min(losses)
-    # if loss_best < lp_loss:
-    #     p_intr = ps[np.argmin(losses)]
-    #     print("p best: {:.2f}".format(p_intr))
-    #     ml_logger.log_metric('p best', p_intr, step='auto')
-    #     lp_point, lp_loss, lp_acc = eval_pnorm(p_intr)
-    #     print("loss p best: {:.4f}".format(lp_loss.item()))
-    #     print("acc p best: {:.4f}".format(lp_acc))
-    #     ml_logger.log_metric('Loss p best', lp_loss.item(), step='auto')
-    #     ml_logger.log_metric('Acc p best', lp_acc, step='auto')
-
-    # idx = np.argmin([maxabs_loss, lp_loss])
-    # init = [max_point, lp_point][idx]
 
     init = lp_point
 
@@ -325,11 +332,9 @@ def main(args, ml_logger):
         print("\n[{}]: Local search callback".format(it))
         print("loss: {:.4f}\n".format(loss.item()))
         print(x)
-        ml_logger.log_metric('Loss {}'.format(args.min_method), loss.item(), step='auto')
 
         # evaluate
         acc = inf_model.validate()
-        ml_logger.log_metric('Acc {}'.format(args.min_method), acc, step='auto')
 
     args.min_method = "Powell"
     method = coord_descent if args.min_method == 'CD' else args.min_method
@@ -341,11 +346,9 @@ def main(args, ml_logger):
     scales = res.x
     mq.set_clipping(scales, inf_model.device)
     loss = inf_model.evaluate_calibration()
-    ml_logger.log_metric('Loss {}'.format(args.min_method), loss.item(), step='auto')
 
     # evaluate
     acc = inf_model.validate()
-    ml_logger.log_metric('Acc {}'.format(args.min_method), acc, step='auto')
     data['powell'] = {'alpha': scales, 'loss': loss.item(), 'acc': acc}
 
     # save scales
@@ -366,6 +369,4 @@ if __name__ == '__main__':
     if args.cal_set_size is None:
         args.cal_set_size = args.batch_size
 
-    with MLlogger(os.path.join(home, 'mxt-sim/mllog_runs'), args.experiment, args,
-                  name_args=[args.arch, args.dataset, "W{}A{}".format(args.bit_weights, args.bit_act)]) as ml_logger:
-        main(args, ml_logger)
+    main(args)
