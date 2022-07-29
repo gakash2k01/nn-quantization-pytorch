@@ -14,7 +14,6 @@ from quantization.quantizer import ModelQuantizer
 import pickle
 from tqdm import tqdm
 
-# We have CnnModel file here
 from utils.data import get_dataset
 from utils.preprocess import get_transform
 from utils.meters import AverageMeter, ProgressMeter, accuracy
@@ -22,6 +21,722 @@ from models.resnet import resnet as custom_resnet
 from models.inception import inception_v3 as custom_inception
 from utils.misc import normalize_module_name, arch2depth
 
+from quantization.methods.clipped_uniform import AngDistanceQuantization, L3NormQuantization, L2NormQuantization, LpNormQuantization, L1NormQuantization, MaxAbsStaticQuantization, AciqLaplaceQuantization, AciqGausQuantization, LogLikeQuantization, MseNoPriorQuantization, MseUniformPriorQuantization, LearnedStepSizeQuantization, FixedClipValueQuantization
+from quantization.methods.non_uniform import KmeansQuantization
+# kmeans.py starts
+import torch
+import numpy as np
+from clustering.pairwise import pairwise_distance
+
+def forgy(X, n_clusters):
+	_len = len(X)
+	indices = np.random.choice(_len, n_clusters)
+	initial_state = X[indices]
+	return initial_state
+
+
+def lloyd1d(X, n_clusters, tol=1e-4, device=None, max_iter=100, init_state=None):
+	if device is not None:
+		X = X.to(device)
+
+	if init_state is None:
+		initial_state = forgy(X, n_clusters).flatten()
+	else:
+		initial_state = init_state.clone()
+
+	iter = 0
+	dis = X.new_empty((n_clusters, X.numel()))
+	choice_cluster = X.new_empty(X.numel()).int()
+	centers = torch.arange(n_clusters, device=X.device).view(-1, 1).int()
+	initial_state_pre = initial_state.clone()
+	# temp = X.new_empty((n_clusters, X.numel()))
+	while iter < max_iter:
+		iter += 1
+
+		# Calculate pair wise distance
+		dis[:, ] = X.view(1, -1)
+		dis.sub_(initial_state.view(-1, 1))
+		dis.pow_(2)
+
+		choice_cluster[:] = torch.argmin(dis, dim=0).int()
+
+		initial_state_pre[:] = initial_state
+
+		temp = X.view(1, -1) * (choice_cluster == centers).float()
+		initial_state[:] = temp.sum(1) / (temp != 0).sum(1).float()
+
+		# center_shift = torch.sum(torch.sqrt(torch.sum((initial_state - initial_state_pre) ** 2, dim=1)))
+		center_shift = torch.sqrt(torch.sum((initial_state - initial_state_pre) ** 2))
+
+		if center_shift < tol:
+			break
+
+	return choice_cluster, initial_state
+
+# kmeans.py ends
+
+
+# pairwise.py starts
+import torch
+import numpy as np
+from clustering.pairwise import pairwise_distance
+
+def forgy(X, n_clusters):
+	_len = len(X)
+	indices = np.random.choice(_len, n_clusters)
+	initial_state = X[indices]
+	return initial_state
+
+
+def lloyd1d(X, n_clusters, tol=1e-4, device=None, max_iter=100, init_state=None):
+	if device is not None:
+		X = X.to(device)
+
+	if init_state is None:
+		initial_state = forgy(X, n_clusters).flatten()
+	else:
+		initial_state = init_state.clone()
+
+	iter = 0
+	dis = X.new_empty((n_clusters, X.numel()))
+	choice_cluster = X.new_empty(X.numel()).int()
+	centers = torch.arange(n_clusters, device=X.device).view(-1, 1).int()
+	initial_state_pre = initial_state.clone()
+	# temp = X.new_empty((n_clusters, X.numel()))
+	while iter < max_iter:
+		iter += 1
+
+		# Calculate pair wise distance
+		dis[:, ] = X.view(1, -1)
+		dis.sub_(initial_state.view(-1, 1))
+		dis.pow_(2)
+
+		choice_cluster[:] = torch.argmin(dis, dim=0).int()
+
+		initial_state_pre[:] = initial_state
+
+		temp = X.view(1, -1) * (choice_cluster == centers).float()
+		initial_state[:] = temp.sum(1) / (temp != 0).sum(1).float()
+
+		# center_shift = torch.sum(torch.sqrt(torch.sum((initial_state - initial_state_pre) ** 2, dim=1)))
+		center_shift = torch.sqrt(torch.sum((initial_state - initial_state_pre) ** 2))
+
+		if center_shift < tol:
+			break
+
+	return choice_cluster, initial_state
+# pairwise.py ends
+
+
+# non-uniform.py starts
+import torch
+import torch.nn as nn
+from clustering.kmeans import lloyd1d
+from .uniform import QuantizationBase
+
+
+class ArgmaxMaskSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, dim=-1):
+        output = input.new_full(input.shape, 0., requires_grad=True)
+        output[torch.arange(output.shape[0]), input.argmax(dim=dim)] = 1
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
+class StepQuantizationSte(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, centroids):
+        b = (centroids[1:] + centroids[:-1]) / 2
+        i = (tensor.view(-1, 1) > b).sum(1)
+        return centroids[i].view(tensor.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
+
+
+class KmeansQuantization(object):
+    def __init__(self, num_bits, max_iter=100, rho=0.5, uniform_init=False):
+        self.num_bits = num_bits
+        self.num_bins = int(2 ** num_bits)
+        self.max_iter = max_iter
+        self.rho =rho
+        self.uniform_init = uniform_init
+
+    def clustering(self, tensor):
+        if self.uniform_init:
+            # Initialize k-means centroids uniformaly
+            rho = 0.5
+            bin_size = (tensor.max() - tensor.min()) / self.num_bins
+            zp = torch.round(tensor.min() / bin_size)
+            x = (torch.arange(self.num_bins, device=tensor.device, dtype=tensor.dtype) + zp) * bin_size
+            init = rho * torch.where(x != 0, x + bin_size / 2, x)
+        else:
+            init = None
+
+        with torch.no_grad():
+            cluster_idx, centers = lloyd1d(tensor.flatten(), self.num_bins, max_iter=self.max_iter, init_state=init, tol=1e-5)
+
+        # workaround for out of memory issue
+        torch.cuda.empty_cache()
+
+        B = torch.zeros(tensor.numel(), self.num_bins, device=tensor.device)
+        B[torch.arange(B.shape[0]), cluster_idx.long()] = 1
+        v = centers.flatten()
+        return B, v
+
+    def __call__(self, tensor):
+        B, v = self.clustering(tensor)
+        tensor_q = torch.matmul(B, v).view(tensor.shape)
+
+        return tensor_q
+
+
+class CentroidsQuantization(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, c, T):
+        b = (c[1:] + c[:-1]) / 2
+        s = c[1:] - c[:-1]
+        # TODO: add not symmetric (Relu) case
+        g = torch.sigmoid(T * (tensor.view(-1, 1) - b))
+
+        ctx.save_for_backward(b, s, g, T)
+
+        y = torch.sum(s * g, dim=1) + c[0]
+        return y.view(tensor.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        b, s, g, T = ctx.saved_tensors
+
+        t = s * g * (1 - g)
+
+        grad_x = T * torch.sum(t, dim=1).view(grad_output.shape)
+        grad_x.mul_(grad_output)
+        grad_x.clamp_(-100, 100)
+
+        # TODO: check dimensions to handle cases where dim=1 less than 4
+        grad_ck = g[:, -1].clone()
+        grad_ck.sub_((T / 2) * t[:, -1])
+        grad_ck.mul_(grad_output.flatten())
+        grad_ck = torch.sum(grad_ck, dim=0).view(-1)
+
+        grad_cj = g[:, :-1] - g[:, 1:]
+        grad_cj.sub_((T / 2) * (t[:, 1:] + t[:, :-1]))
+        grad_cj.mul_(grad_output.view(-1, 1))
+        grad_cj = torch.sum(grad_cj, dim=0).view(-1)
+
+        grad_c0 = -g[:, 0].clone()
+        grad_c0.sub_((T / 2) * t[:, 0])
+        grad_c0.add_(1.)
+        grad_c0.mul_(grad_output.flatten())
+        grad_c0 = torch.sum(grad_c0, dim=0).view(-1)
+
+        grad_c = torch.clamp(torch.cat((grad_c0, grad_cj, grad_ck)), -1, 1)
+
+        return grad_x, grad_c, None
+
+
+class LearnedCentroidsQuantization(QuantizationBase):
+    c_param_name = 'c'
+
+    def __init__(self, module, num_bits, symmetric, tensor, temperature):
+        super(LearnedCentroidsQuantization, self).__init__(module, num_bits, symmetric)
+        self.soft_quant = True
+        self.hard_quant = False
+
+        with torch.no_grad():
+            # Initialize k-means centroids uniformaly
+            _, centers = KmeansQuantization(num_bits).clustering(tensor)
+            edges, _ = centers.flatten().sort()
+
+        self.register_buffer('centroids', edges)
+        self.register_buffer('temperature', tensor.new_tensor([temperature]))
+        self.register_buffer('rho', tensor.new_tensor([1.]))
+
+        self.register_parameter(self.c_param_name, edges.new_ones(edges.shape))
+
+        self.__create_optim_params__()
+
+    def __call__(self, tensor):
+        c = self.centroids * self.c
+
+        # Soft quantization
+        if self.soft_quant:
+            T = self.temperature
+            # b = (c[1:] + c[:-1]) / 2
+            # s = c[1:] - c[:-1]
+            #
+            # y = torch.sum(s * torch.sigmoid(T * (tensor.view(-1, 1) - b)), dim=1).view(tensor.shape)
+            # if self.symmetric:
+            #     # In symmetric case shift central bin to 0
+            #     tensor_soft = y + c[0]
+            # else:
+            #     # Asymmetric case after relu, avoid changing zeros in the tensor
+            #     tensor_soft = torch.where(tensor > 0, y, tensor)
+
+            tensor_soft = CentroidsQuantization.apply(tensor, c, T)
+
+        # Hard quantization
+        if self.hard_quant:
+            tensor_hard = StepQuantizationSte().apply(tensor, c)
+
+        if self.soft_quant and self.hard_quant:
+            print('Hello')
+            assert False
+            # tensor_q = self.rho * tensor_soft + (1 - self.rho) * tensor_hard
+        elif self.soft_quant:
+            tensor_q = tensor_soft
+        elif self.hard_quant:
+            tensor_q = tensor_hard
+        else:
+            raise RuntimeError('quantization not defined!!!')
+
+        return tensor_q
+
+    def loggable_parameters(self):
+        lp = super(LearnedCentroidsQuantization, self).loggable_parameters()
+        return lp + [('ctr', self.centroids * self.c),
+                     ('rho', self.rho),
+                     ('temperature', self.temperature)]
+
+    def __create_optim_params__(self):
+        # 3 bit width configuration. Need to see how to find those parameters more easily per bit width/model/dataset
+        # self.__add_optim_params__('SGD', 'imagenet', [
+        #     (self.c_param_name, {'params': [self.c], 'lr': 1e-4, 'momentum': 0, 'weight_decay': 0}),
+        #     (self.T_param_name, {'params': [self.T], 'lr': 1e-2, 'momentum': 0, 'weight_decay': 0})
+        # ])
+        self.__add_optim_params__('SGD', 'imagenet', [
+            (self.c_param_name, {'params': [self.c], 'lr': 1e-2, 'momentum': 0, 'weight_decay': 0}),
+            # (self.T_param_name, {'params': [self.T], 'lr': 1e-1, 'momentum': 0, 'weight_decay': 0})
+        ])
+        self.__add_optim_params__('Adam', 'imagenet', [
+            (self.c_param_name, {'params': [self.c], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0}),
+            # (self.T_param_name, {'params': [self.T], 'lr': 1e-2, 'momentum': 0, 'weight_decay': 0})
+        ])
+        self.__add_optim_params__('SGD', 'cifar10', [
+            (self.c_param_name, {'params': [self.c], 'lr': 1e-2, 'momentum': 0, 'weight_decay': 0}),
+            # (self.T_param_name, {'params': [self.T], 'lr': 1e-2, 'momentum': 0, 'weight_decay': 0})
+        ])
+        self.__add_optim_params__('Adam', 'cifar10', [
+            (self.c_param_name, {'params': [self.c], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0}),
+            # (self.T_param_name, {'params': [self.T], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0})
+        ])
+
+    @staticmethod
+    def learned_parameters():
+        # Use this function to control what parameters to learn
+        return [
+                LearnedCentroidsQuantization.c_param_name
+                ]
+
+    def clustering(self, tensor):
+        tq = self.quantize(tensor)
+        B_tag = torch.abs(tq.view(-1, 1) - self.c.view(1, -1))
+        B = B_tag.new_zeros(B_tag.shape)
+        B[torch.arange(B.shape[0]), B_tag.argmin(dim=1)] = 1
+
+        return B, self.c
+
+
+class LearnedSigmoidQuantization(QuantizationBase):
+    alpha_param_name = 'alpha'
+    beta_param_name = 'beta'
+    b_param_name = 'b'
+
+    def __init__(self, module, num_bits, symmetric, tensor, temperature):
+        super(LearnedCentroidsQuantization, self).__init__(module, num_bits, symmetric)
+        self.temperature = temperature
+        # TODO: change to symmetric
+        self.Y = tensor.new_tensor([0, 1, 2, 4])
+
+        with torch.no_grad():
+            b = (self.Y[1:] + self.Y[:-1]) / 2
+
+        self.register_parameter(self.beta_param_name, tensor.new_tensor([self.num_bins / tensor.abs().max()]))
+        self.register_parameter(self.alpha_param_name, 1 / self.beta)
+        self.register_parameter(self.b_param_name, b)
+
+        self.__create_optim_params__()
+
+    def __call__(self, tensor):
+        T = self.temperature
+        s = self.Y[1:] - self.Y[:-1]
+
+        temp = torch.clamp(T * (self.beta * tensor.view(-1, 1) - self.b), -10, 10)
+        # Assume relu, handle zeros issue
+        tensor_q = torch.where(tensor > 0,
+                               self.alpha * torch.sum(s * torch.sigmoid(temp), dim=1).view(tensor.shape),
+                               tensor)
+        # tensor_q = LearnableSigmoidQuantization.SigmoidQuantSte().apply(tensor_q, self.alpha, self.beta, s, self.b, 1e10)
+
+        # Hard quantization
+        tensor_q = StepQuantizationSte().apply(tensor_q, self.c)
+
+        return tensor_q
+
+    def __create_optim_params__(self):
+        self.__add_optim_params__('SGD', 'imagenet', [
+            (self.alpha_param_name, {'params': [self.alpha], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0}),
+            (self.beta_param_name, {'params': [self.beta], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0}),
+            (self.b_param_name, {'params': [self.b], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0})
+        ])
+
+    @staticmethod
+    def learned_parameters():
+        return [
+                LearnedSigmoidQuantization.alpha_param_name,
+                LearnedSigmoidQuantization.beta_param_name,
+                LearnedSigmoidQuantization.b_param_name
+                ]
+
+
+class LearnableDifferentiableQuantization(object):
+    binning_param_name = 'tensor_binning'
+    T_param_name = 'lsiq_T'
+
+    def __init__(self, module, tensor, num_bits):
+        self.num_bits = num_bits
+        self.temperature = 1
+        self.num_bins = int(2 ** num_bits)
+        self.c = None
+
+        with torch.no_grad():
+            # Initialize B with k-means quantization
+            B, _ = KmeansQuantization(num_bits).clustering(tensor)
+
+        module.register_parameter(self.binning_param_name, nn.Parameter(B))
+        self.tensor_binning = getattr(module, self.binning_param_name)
+
+        module.register_parameter(self.T_param_name, nn.Parameter(tensor.new_tensor([1 / self.temperature])))
+        self.T = getattr(module, self.T_param_name)
+
+        self.sm = nn.Softmax(dim=1)
+
+    def clustering(self, tensor):
+        B = ArgmaxMaskSTE().apply(self.tensor_binning)
+        v = torch.matmul(tensor.view(-1), B) / B.sum(dim=0)
+        return B, v
+
+    def quantize(self, tensor):
+        T = 1 / self.T.abs()
+
+        # Soft quantization
+        B = self.sm(T * self.tensor_binning)
+        v = torch.matmul(tensor.view(-1), B) / B.sum(dim=0)
+        tensor_q = torch.matmul(B, v).view(tensor.shape)
+
+        # Hard quantization
+        tensor_q = StepQuantizationSte().apply(tensor_q, v)
+
+        self.c = v.detach().cpu()
+
+        return tensor_q
+
+    def loggable_parameters(self):
+        return [('c', self.c), (LearnableDifferentiableQuantization.T_param_name, 1 / self.T.detach())]
+
+    def named_parameters(self):
+        np = [
+              (LearnableDifferentiableQuantization.binning_param_name, self.tensor_binning),
+              (LearnableDifferentiableQuantization.T_param_name, self.T),
+              ]
+
+        named_params = [(n, p) for n, p in np if n in self.learnable_parameters_names()]
+        return named_params
+
+    def optim_parameters(self):
+        pdict = [
+            (LearnableDifferentiableQuantization.binning_param_name, {'params': [self.tensor_binning], 'lr': 1e-1, 'momentum': 0, 'weight_decay': 0}),
+            (LearnableDifferentiableQuantization.T_param_name, {'params': [self.T], 'lr': 1e-2, 'momentum': 0, 'weight_decay': 0}),
+        ]
+
+        params = [d for n, d in pdict if n in self.learnable_parameters_names()]
+        return params
+
+    @staticmethod
+    def learnable_parameters_names():
+        return [
+                LearnableDifferentiableQuantization.binning_param_name,
+                LearnableDifferentiableQuantization.T_param_name
+                ]
+# non-uniform.py ends
+
+
+# clipped.py starts
+import numpy as np
+import scipy.optimize as opt
+import torch
+
+from .uniform import UniformQuantization
+
+
+class ClippedUniformQuantization(UniformQuantization):
+    alpha_param_name = 'alpha'
+
+    def __init__(self, module, num_bits, symmetric, uint=False, stochastic=False, tails=False):
+        super(ClippedUniformQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic,tails)
+
+    def __call__(self, tensor):
+        t_q = self.__quantize__(tensor, self.alpha)
+        return t_q
+
+    def __for_repr__(self):
+        rpr = super(ClippedUniformQuantization, self).__for_repr__()
+        return [(self.alpha_param_name, '{:.4f}'.format(getattr(self, self.alpha_param_name).item()))] + rpr
+
+
+class FixedClipValueQuantization(ClippedUniformQuantization):
+    def __init__(self, module, num_bits, symmetric, uint=False, stochastic=False, kwargs={}):
+        super(FixedClipValueQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic)
+        self.clip_value = kwargs['clip_value']
+        self.device = kwargs['device']
+        with torch.no_grad():
+            self.register_buffer(self.alpha_param_name, torch.tensor([self.clip_value], dtype=torch.float32).to(self.device))
+
+
+class MaxAbsStaticQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, kwargs={}):
+        super(MaxAbsStaticQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic)
+
+        with torch.no_grad():
+            self.register_buffer(self.alpha_param_name, tensor.new_tensor([tensor.abs().max()]))
+
+
+class LearnedStepSizeQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, **kwargs):
+        super(LearnedStepSizeQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic)
+
+        with torch.no_grad():
+            maxabs = tensor.abs().max()
+
+        self.register_parameter(self.alpha_param_name, tensor.new_tensor([maxabs]))
+
+        self.__create_optim_params__()
+
+    def __create_optim_params__(self):
+        # TODO: create default configuration
+        self.__add_optim_params__('SGD', 'imagenet', [
+            (self.alpha_param_name, {'params': [getattr(self, self.alpha_param_name)], 'lr': 1e-3, 'momentum': 0, 'weight_decay': 0})
+        ])
+        self.__add_optim_params__('SGD', 'cifar10', [
+            (self.alpha_param_name, {'params': [getattr(self, self.alpha_param_name)], 'lr': 1e-1, 'momentum': 0, 'weight_decay': 0})
+        ])
+
+    @staticmethod
+    def learned_parameters():
+        return [
+                LearnedStepSizeQuantization.alpha_param_name
+                ]
+
+
+class AngDistanceQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(AngDistanceQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor),
+                                            bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        xq = self.__quantize__(x, alpha)
+
+        norm_x = torch.norm(x)
+        norm_xq = torch.norm(xq)
+        cos = torch.dot(x.flatten(), xq.flatten()) / (norm_x * norm_xq)
+        err = torch.acos(cos)
+        return err.item()
+
+
+class LpNormQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(LpNormQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        self.p = kwargs['lp']
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor),
+                                            bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        xq = self.__quantize__(x, alpha)
+        err = torch.mean(torch.abs(xq - x) ** self.p)
+        return err.item()
+
+
+class L1NormQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(L1NormQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor),
+                                            bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        N = x.numel() if self.symmetric else x[x != 0].numel()
+        xq = self.__quantize__(x, alpha)
+        err = torch.sum(torch.abs(xq - x)) / N
+        return err.item()
+
+
+class L2NormQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(L2NormQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor),
+                                            bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        N = x.numel() if self.symmetric else x[x != 0].numel()
+        xq = self.__quantize__(x, alpha)
+        err = torch.sum(torch.abs(xq - x) ** 2) / N
+        return err.item()
+
+
+class L3NormQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(L3NormQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor),
+                                            bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        N = x.numel() if self.symmetric else x[x != 0].numel()
+        xq = self.__quantize__(x, alpha)
+        err = torch.sum(torch.abs(xq - x) ** 3) / N
+        return err.item()
+
+
+class MseNoPriorQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(MseNoPriorQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor),
+                                            bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        delta = (2 if self.symmetric else 1) * alpha / (self.num_bins - 1)
+        if self.tails:
+            Cx = torch.clamp(x,(-alpha if self.symmetric else 0.) - delta / 2, alpha + delta / 2)
+        else:
+            Cx = torch.clamp(x, -alpha if self.symmetric else 0., alpha)
+        Ci = Cx - x
+
+        N = x.numel() if self.symmetric else x[x != 0].numel()
+        xq = self.__quantize__(x, alpha)
+
+        qerr_exp = torch.sum((xq - Cx)) / N
+        qerrsq_exp = torch.sum((xq - Cx) ** 2) / N
+        cerr = torch.sum(Ci ** 2) / N
+        mixed_err = 2 * torch.sum(Ci) * alpha * qerr_exp / N
+        mse = qerrsq_exp + cerr + mixed_err
+        return mse.item()
+
+
+class LogLikeQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, tails=False, kwargs={}):
+        super(LogLikeQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic, tails)
+
+        with torch.no_grad():
+            if symmetric:
+                self.b = tensor.abs().mean()
+            else:
+                # We need to measure b before ReLu.
+                # Instead assume zero mean and multiply b after relu by 2 to approximation b before relu.
+                self.b = tensor[tensor != 0].abs().mean()
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor)).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        delta = (2 if self.symmetric else 1) * alpha / (self.num_bins - 1)
+        Nq = x[(x > 0) & (x <= alpha)].numel()
+        Nc = x[x > alpha].numel()
+        clip_err = ((x[x > alpha]- alpha) / self.b).sum() + Nc * torch.log(torch.clamp(self.b, 1e-30, 1e+30))
+        q_err = Nq * np.log(np.max([delta, 1e-100]))
+        # print("alpha={}, delta={}, q={}, c={}, tot={}".format(alpha,delta,q_err, clip_err.item(),clip_err.item() + q_err + add))
+        return clip_err.item() + q_err
+
+
+class MseUniformPriorQuantization(ClippedUniformQuantization):
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, kwargs={}):
+        super(MseUniformPriorQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic)
+
+        with torch.no_grad():
+            opt_alpha = opt.minimize_scalar(lambda alpha: self.estimate_quant_error(alpha, tensor), bounds=(tensor.min().item(), tensor.max().item())).x
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([opt_alpha]))
+
+    def estimate_quant_error(self, alpha, x):
+        N = x.numel() if self.symmetric else x[x != 0].numel()
+        clip_err = torch.sum((torch.clamp(x, -alpha, alpha) - x) ** 2) / N
+        quant_err = alpha ** 2 / ((3 if self.symmetric else 12) * (2 ** (2 * self.num_bits)))
+        err = clip_err + quant_err
+        return err.item()
+
+
+class AciqGausQuantization(ClippedUniformQuantization):
+    gaus_mult = {1: 1.24, 2: 1.71, 3: 2.15, 4: 2.55, 5: 2.93, 6: 3.28, 7: 3.61, 8: 3.92}
+    gaus_mult_positive = {1: 1.71, 2: 2.15, 3: 2.55, 4: 2.93, 5: 3.28, 6: 3.61, 7: 3.92, 8: 4.2}
+
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, kwargs={}):
+        super(AciqGausQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic)
+
+        with torch.no_grad():
+            if self.symmetric:
+                sigma = tensor.std()
+                alpha_opt = self.gaus_mult[self.num_bits] * sigma
+            else:
+                # We need to measure std before ReLu.
+                # Instead assume zero mean and multiply std after relu by 2 to approximation std before relu.
+                sigma = torch.sqrt(torch.mean(tensor[tensor != 0]**2))
+                alpha_opt = self.gaus_mult_positive[self.num_bits] * sigma
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([alpha_opt]))
+
+
+class AciqLaplaceQuantization(ClippedUniformQuantization):
+    laplace_mult = {0: 1.05, 1: 1.86, 2: 2.83, 3: 3.89, 4: 5.03, 5: 6.2, 6: 7.41, 7: 8.64, 8: 9.89}
+    laplace_mult_positive = {0: 1.86, 1: 2.83, 2: 3.89, 3: 5.02, 4: 6.2, 5: 7.41, 6: 8.64, 7: 9.89, 8: 11.16}
+
+    def __init__(self, module, tensor, num_bits, symmetric, uint=False, stochastic=False, kwargs={}):
+        super(AciqLaplaceQuantization, self).__init__(module, num_bits, symmetric, uint, stochastic)
+
+        with torch.no_grad():
+            if symmetric:
+                b = tensor.abs().mean()
+                alpha = self.laplace_mult[self.num_bits] * b
+            else:
+                # We need to measure b before ReLu.
+                # Instead assume zero mean and multiply b after relu by 2 to approximation b before relu.
+                b = tensor[tensor != 0].abs().mean()
+                alpha = self.laplace_mult_positive[self.num_bits] * b
+
+        self.register_buffer(self.alpha_param_name, tensor.new_tensor([alpha]))
+# clipped.py ends
+
+
+# We have CnnModel file here
 class CnnModel(object):
     def __init__(self, arch, use_custom_resnet, use_custom_inception, pretrained, dataset, gpu_ids, datapath, batch_size, shuffle, workers,
                  print_freq, cal_batch_size, cal_set_size, args):
@@ -177,13 +892,6 @@ class CnnModel(object):
 # CnnModel file ends
 
 # We have module_wrapper here
-from quantization.methods.clipped_uniform import AngDistanceQuantization, L3NormQuantization, L2NormQuantization, \
-    LpNormQuantization, L1NormQuantization
-from quantization.methods.clipped_uniform import MaxAbsStaticQuantization, AciqLaplaceQuantization, \
-    AciqGausQuantization, LogLikeQuantization
-from quantization.methods.clipped_uniform import MseNoPriorQuantization, MseUniformPriorQuantization
-from quantization.methods.non_uniform import KmeansQuantization
-
 quantization_mapping = {'max_static': MaxAbsStaticQuantization,
                         'aciq_laplace': AciqLaplaceQuantization,
                         'aciq_gaus': AciqGausQuantization,
@@ -398,15 +1106,6 @@ class ParameterModuleWrapperPost(nn.Module):
 # module_wrapper ends here
 
 # quantizer.py starts here
-import torch
-import torch.nn as nn
-import numpy as np
-from itertools import count
-from quantization.methods.clipped_uniform import LearnedStepSizeQuantization
-from quantization.methods.non_uniform import LearnableDifferentiableQuantization, LearnedCentroidsQuantization
-from quantization.methods.clipped_uniform import FixedClipValueQuantization
-# from utils.absorb_bn import is_absorbing, is_bn
-
 
 class Conv2dFunctor:
     def __init__(self, conv2d):
