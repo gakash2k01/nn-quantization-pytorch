@@ -1,4 +1,4 @@
-r'''
+'''
 calculation of pairwise distance, and return condensed result, i.e. we omit the diagonal and duplicate entries and store everything in a one-dimensional array
 '''
 import torch

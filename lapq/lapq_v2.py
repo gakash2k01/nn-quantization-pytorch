@@ -20,14 +20,11 @@ from utils.meters import AverageMeter, ProgressMeter, accuracy
 from models.resnet import resnet as custom_resnet
 from models.inception import inception_v3 as custom_inception
 from utils.misc import normalize_module_name, arch2depth
-
-from quantization.methods.clipped_uniform import AngDistanceQuantization, L3NormQuantization, L2NormQuantization, LpNormQuantization, L1NormQuantization, MaxAbsStaticQuantization, AciqLaplaceQuantization, AciqGausQuantization, LogLikeQuantization, MseNoPriorQuantization, MseUniformPriorQuantization, LearnedStepSizeQuantization, FixedClipValueQuantization
-from quantization.methods.non_uniform import KmeansQuantization
+from .uniform import QuantizationBase, UniformQuantization
+from utils.absorb_bn import search_absorbe_bn
+# from quantization.methods.clipped_uniform import AngDistanceQuantization, L3NormQuantization, L2NormQuantization, LpNormQuantization, L1NormQuantization, MaxAbsStaticQuantization, AciqLaplaceQuantization, AciqGausQuantization, LogLikeQuantization, MseNoPriorQuantization, MseUniformPriorQuantization, LearnedStepSizeQuantization, FixedClipValueQuantization
+# from quantization.methods.non_uniform import KmeansQuantization
 # kmeans.py starts
-import torch
-import numpy as np
-from clustering.pairwise import pairwise_distance
-
 def forgy(X, n_clusters):
 	_len = len(X)
 	indices = np.random.choice(_len, n_clusters)
@@ -77,64 +74,47 @@ def lloyd1d(X, n_clusters, tol=1e-4, device=None, max_iter=100, init_state=None)
 
 
 # pairwise.py starts
-import torch
-import numpy as np
-from clustering.pairwise import pairwise_distance
+'''
+calculation of pairwise distance, and return condensed result, i.e. we omit the diagonal and duplicate entries and store everything in a one-dimensional array
+'''
+def pairwise_distance(data1, data2=None, device=-1):
+	r'''
+	using broadcast mechanism to calculate pairwise ecludian distance of data
+	the input data is N*M matrix, where M is the dimension
+	we first expand the N*M matrix into N*1*M matrix A and 1*N*M matrix B
+	then a simple elementwise operation of A and B will handle the pairwise operation of points represented by data
+	'''
+	if data2 is None:
+		data2 = data1
 
-def forgy(X, n_clusters):
-	_len = len(X)
-	indices = np.random.choice(_len, n_clusters)
-	initial_state = X[indices]
-	return initial_state
+	if device!=-1:
+		data1, data2 = data1.cuda(device), data2.cuda(device)
 
+	#N*1*M
+	A = data1.unsqueeze(dim=1)
 
-def lloyd1d(X, n_clusters, tol=1e-4, device=None, max_iter=100, init_state=None):
-	if device is not None:
-		X = X.to(device)
+	#1*N*M
+	B = data2.unsqueeze(dim=0)
 
-	if init_state is None:
-		initial_state = forgy(X, n_clusters).flatten()
-	else:
-		initial_state = init_state.clone()
+	dis = (A-B)**2.0
+	#return N*N matrix for pairwise distance
+	dis = dis.sum(dim=-1).squeeze()
+	return dis
 
-	iter = 0
-	dis = X.new_empty((n_clusters, X.numel()))
-	choice_cluster = X.new_empty(X.numel()).int()
-	centers = torch.arange(n_clusters, device=X.device).view(-1, 1).int()
-	initial_state_pre = initial_state.clone()
-	# temp = X.new_empty((n_clusters, X.numel()))
-	while iter < max_iter:
-		iter += 1
-
-		# Calculate pair wise distance
-		dis[:, ] = X.view(1, -1)
-		dis.sub_(initial_state.view(-1, 1))
-		dis.pow_(2)
-
-		choice_cluster[:] = torch.argmin(dis, dim=0).int()
-
-		initial_state_pre[:] = initial_state
-
-		temp = X.view(1, -1) * (choice_cluster == centers).float()
-		initial_state[:] = temp.sum(1) / (temp != 0).sum(1).float()
-
-		# center_shift = torch.sum(torch.sqrt(torch.sum((initial_state - initial_state_pre) ** 2, dim=1)))
-		center_shift = torch.sqrt(torch.sum((initial_state - initial_state_pre) ** 2))
-
-		if center_shift < tol:
-			break
-
-	return choice_cluster, initial_state
+def group_pairwise(X, groups, device=0, fun=lambda r,c: pairwise_distance(r, c).cpu()):
+	group_dict = {}
+	for group_index_r, group_r in enumerate(groups):
+		for group_index_c, group_c in enumerate(groups):
+			R, C = X[group_r], X[group_c]
+			if device!=-1:
+				R = R.cuda(device)
+				C = C.cuda(device)
+			group_dict[(group_index_r, group_index_c)] = fun(R, C)
+	return group_dict
 # pairwise.py ends
 
 
 # non-uniform.py starts
-import torch
-import torch.nn as nn
-from clustering.kmeans import lloyd1d
-from .uniform import QuantizationBase
-
-
 class ArgmaxMaskSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, dim=-1):
@@ -468,13 +448,6 @@ class LearnableDifferentiableQuantization(object):
 
 
 # clipped.py starts
-import numpy as np
-import scipy.optimize as opt
-import torch
-
-from .uniform import UniformQuantization
-
-
 class ClippedUniformQuantization(UniformQuantization):
     alpha_param_name = 'alpha'
 
@@ -792,7 +765,7 @@ class CnnModel(object):
 
         if args.bn_folding:
             print("Applying batch-norm folding ahead of post-training quantization")
-            from utils.absorb_bn import search_absorbe_bn
+            
             search_absorbe_bn(model)
 
         # define loss function (criterion) and optimizer
